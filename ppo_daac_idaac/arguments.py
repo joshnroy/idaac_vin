@@ -95,6 +95,11 @@ parser.add_argument(
     choices=['idaac', 'daac', 'ppo'],
     help='algorithm to use')
 parser.add_argument(
+    '--arch',
+    default='feedforward',
+    choices=['feedforward', 'vin'],
+    help='algorithm to use')
+parser.add_argument(
     '--log_dir',
     default='logs',
     help='directory to save agent logs')

@@ -6,6 +6,7 @@ import torch.nn.functional as F
 
 from ppo_daac_idaac.utils import init
 from ppo_daac_idaac.distributions import Categorical
+from ppo_daac_idaac.distributions import FixedCategorical
 
 
 init_ = lambda m: init(m, nn.init.orthogonal_, lambda x: nn.init.
@@ -362,10 +363,18 @@ class IDAACnet(nn.Module):
     def forward(self, inputs):
         raise NotImplementedError
 
-    def act(self, inputs, deterministic=False):
-        gae, actor_features = self.base(inputs)
-        value = self.value_net(inputs)
+    def run_actor(self, x):
+        gae, actor_features = self.base(x)
         dist = self.dist(actor_features)
+
+        return dist, gae, actor_features
+
+    def act(self, inputs, deterministic=False):
+        dist, _, _ = self.run_actor(inputs)
+        # gae, actor_features = self.base(inputs)
+        # dist = self.dist(actor_features)
+
+        value = self.value_net(inputs)
 
         if deterministic:
             action = dist.mode()
@@ -384,11 +393,108 @@ class IDAACnet(nn.Module):
         return value
 
     def evaluate_actions(self, inputs, action):
-        gae, actor_features = self.base(inputs, action)
+        dist, gae, actor_features = self.run_actor(inputs)
+        # gae, actor_features = self.base(inputs, action)
+        # dist = self.dist(actor_features)
+
         value = self.value_net(inputs)
-        dist = self.dist(actor_features)
 
         action_log_probs = dist.log_probs(action)
         dist_entropy = dist.entropy().mean()
 
         return actor_features, gae, value, action_log_probs, dist_entropy
+
+class SpatialSoftmax2d(nn.Module):
+    def __init__(self):
+        super(SpatialSoftmax2d, self).__init__()
+
+    def forward(self, input):
+        return F.softmax(
+            input.reshape(input.shape[0], input.shape[1], input.shape[2] * input.shape[3]),
+            dim=2).reshape(input.shape)
+
+class VINnet(IDAACnet):
+    """
+    VIN Network
+    """
+    def __init__(self, obs_shape, num_actions, base_kwargs=None, num_planning_steps=10):
+        super(VINnet, self).__init__(obs_shape, num_actions, base_kwargs=base_kwargs)
+
+        self.num_planning_steps = num_planning_steps
+        self.num_actions = num_actions
+
+        in_channels = 1
+        hidden_channels = 16
+
+        self.reward_model = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_channels, kernel_size=1, padding=0), 
+            nn.ReLU(inplace=True), 
+            nn.Conv2d(hidden_channels, 1, kernel_size=1, padding=0), 
+        )
+        self.transition_model = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1), 
+            nn.ReLU(inplace=True), 
+            nn.Conv2d(hidden_channels, 1, kernel_size=3, padding=1), 
+        )
+        self.done_model = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_channels, kernel_size=1, padding=0), 
+            nn.ReLU(inplace=True), 
+            nn.Conv2d(hidden_channels, 1, kernel_size=1, padding=0), 
+        )
+        self.attention_model = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1), 
+            nn.ReLU(inplace=True), 
+            nn.Conv2d(hidden_channels, 1, kernel_size=3, padding=1), 
+            SpatialSoftmax2d()
+        )
+        self.dynamics_model = nn.Conv2d(2, num_actions, kernel_size=3, padding=1)
+
+    def run_actor(self, x):
+        gae, actor_features = self.base(x)
+
+        # Reshape to be 2d
+        in_representation = torch.reshape(actor_features, (actor_features.shape[0], 1, 16, 16))
+
+        # Generate VIN Components
+        reward_grid = self.reward_model(in_representation)
+        transition_info = self.transition_model(in_representation)
+        done_grid = self.done_model(in_representation)
+        attention_grid = self.attention_model(in_representation)
+
+        # Do VIN
+        value = torch.zeros_like(reward_grid)
+        for _ in range(self.num_planning_steps):
+            stacked = torch.cat([value, reward_grid], dim=1)
+            assert stacked.shape[0] == value.shape[0]
+            assert stacked.shape[1] == 2 * value.shape[1]
+            assert stacked.shape[2] == value.shape[2]
+            assert stacked.shape[3] == value.shape[3]
+
+            q_grid = self.dynamics_model(stacked * transition_info)
+            assert q_grid.shape[0] == value.shape[0]
+            assert q_grid.shape[1] == self.num_actions
+            assert q_grid.shape[2] == value.shape[2]
+            assert q_grid.shape[3] == value.shape[3]
+
+            value_grid, _ = torch.max(q_grid, dim=1, keepdim=True)
+            assert value_grid.shape[0] == value.shape[0]
+            assert value_grid.shape[1] == 1
+            assert value_grid.shape[2] == value.shape[2]
+            assert value_grid.shape[3] == value.shape[3]
+
+            value = done_grid * value_grid
+            assert value.shape[0] == value.shape[0]
+            assert value.shape[1] == 1
+            assert value.shape[2] == value.shape[2]
+            assert value.shape[3] == value.shape[3]
+
+
+        # Apply attention model to select cell
+        q_outputs = torch.sum((attention_grid * q_grid), dim=[2, 3])
+
+        assert q_outputs.shape[0] == value.shape[0]
+        assert q_outputs.shape[1] == self.num_actions
+
+        dist = FixedCategorical(logits=q_outputs)
+
+        return dist, gae, actor_features

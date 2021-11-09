@@ -17,7 +17,7 @@ from baselines.common.vec_env import (
 from ppo_daac_idaac import algo, utils
 from ppo_daac_idaac.arguments import parser
 from ppo_daac_idaac.model import PPOnet, IDAACnet, \
-    LinearOrderClassifier, NonlinearOrderClassifier
+    LinearOrderClassifier, NonlinearOrderClassifier, VINnet
 from ppo_daac_idaac.storage import DAACRolloutStorage, \
     IDAACRolloutStorage, RolloutStorage
 from ppo_daac_idaac.envs import VecPyTorchProcgen
@@ -46,7 +46,7 @@ def train(args):
     torch.set_num_threads(1)
     device = torch.device("cuda:0" if args.cuda else "cpu")
 
-    log_file = '-{}-{}-s{}'.format(args.env_name, args.algo, args.seed)
+    log_file = '-{}-{}-{}-s{}'.format(args.env_name, args.algo, args.arch, args.seed)
     logger.configure(dir=args.log_dir, format_strs=['csv', 'stdout'], log_suffix=log_file)
     print("\nLog File: ", log_file)
 
@@ -59,7 +59,12 @@ def train(args):
     envs = VecPyTorchProcgen(venv, device)
 
     obs_shape = envs.observation_space.shape     
-    if args.algo == 'ppo':
+    if args.arch == 'vin':
+        actor_critic = VINnet(
+            obs_shape,
+            envs.action_space.n,
+            base_kwargs={'hidden_size': args.hidden_size})    
+    elif args.algo == 'ppo':
         actor_critic = PPOnet(
             obs_shape,
             envs.action_space.n,
